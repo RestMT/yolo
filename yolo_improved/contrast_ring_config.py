@@ -12,8 +12,8 @@ class ContrastRingLossConfig:
     outer_kernel: int = 7
     contrast_tau: float = 0.25
     positive_gain: float = 0.25
-    negative_gain: float = 0.50
-    negative_gamma: float = 2.0
+    negative_gain: float = 0.25
+    negative_gamma: float = 3.0
     eps: float = 1e-6
 
     def __post_init__(self) -> None:

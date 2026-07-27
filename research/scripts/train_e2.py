@@ -26,7 +26,7 @@ DEFAULT_DATA_YAML = (
 DEFAULT_PROJECT_DIRECTORY = (
     REPOSITORY_ROOT
     / "runs"
-    / "e2-contrast-ring"
+    / "e2-1b-contrast-ring"
     / "roboflow-v1"
 )
 
