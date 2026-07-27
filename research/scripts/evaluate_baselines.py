@@ -3,12 +3,17 @@ from __future__ import annotations
 import argparse
 import csv
 import re
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
-from ultralytics import YOLO
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from ultralytics import YOLO  # noqa: E402
 
 
 MODEL_SIZES = ("n", "s", "m", "l", "x")
@@ -19,8 +24,6 @@ MODEL_ORDER = {
     "l": 3,
     "x": 4,
 }
-
-REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 DEFAULT_DATA_YAML = (
     REPOSITORY_ROOT
