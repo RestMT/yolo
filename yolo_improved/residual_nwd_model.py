@@ -58,7 +58,9 @@ class ResidualNWDDetectionTrainer(DetectionTrainer):
         overrides = dict(overrides or {})
         self.loss_config = _resolve_loss_config(overrides.pop(_LOSS_CONFIG_KEY, None))
         super().__init__(cfg=cfg, overrides=overrides, _callbacks=_callbacks)
-        setattr(self.args, _LOSS_CONFIG_KEY, asdict(self.loss_config))
+        # Only the DDP launcher serializes args; workers have already resolved this config before validation.
+        if self.ddp:
+            setattr(self.args, _LOSS_CONFIG_KEY, asdict(self.loss_config))
 
     def get_model(self, cfg: str | None = None, weights=None, verbose: bool = True):
         """Return a residual NWD model with the stock detection architecture."""
