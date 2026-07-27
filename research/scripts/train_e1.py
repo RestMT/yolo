@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import argparse
 import gc
+import sys
 from pathlib import Path
 
 import torch
 
-from yolo_improved import HybridYOLO
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from yolo_improved import HybridYOLO  # noqa: E402
 
 
 MODEL_SIZES = ("n", "s", "m", "l", "x")
-
-REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 DEFAULT_DATA_YAML = (
     REPOSITORY_ROOT
