@@ -12,6 +12,7 @@ from torch import nn
 from torch.nn.init import constant_, xavier_uniform_
 
 from ultralytics.utils import NOT_MACOS14
+from ultralytics.utils.ops import make_divisible
 from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import TORCH_1_11, fuse_conv_and_bn, smart_inference_mode
 
@@ -25,14 +26,173 @@ __all__ = (
     "Classify",
     "Depth",
     "Detect",
+    "GeometryPreservingSpatialMorphologyDetect",
+    "MorphologyAdaptiveAdapter",
+    "MorphologyAdaptiveDetect",
     "Pose",
     "RTDETRDecoder",
     "Segment",
     "SemanticSegment",
+    "SpatialMorphologyClassificationAdapter",
     "YOLOEDetect",
     "YOLOESegment",
     "v10Detect",
 )
+
+
+class MorphologyAdaptiveAdapter(nn.Module):
+    """Zero-gated spatial mixture of morphology-sensitive depthwise branches."""
+
+    def __init__(
+        self,
+        channels: int,
+        hidden_ratio: float = 0.125,
+        min_hidden: int = 16,
+        max_hidden: int = 96,
+        strip_kernel: int = 7,
+        context_dilation: int = 2,
+        gate_max: float = 0.5,
+        trainable_adapter: bool = True,
+    ):
+        """Initialize one morphology-adaptive residual feature adapter."""
+        super().__init__()
+        if not isinstance(channels, int) or isinstance(channels, bool) or channels <= 0:
+            raise ValueError(f"channels must be a positive integer, got {channels!r}.")
+        if isinstance(hidden_ratio, bool):
+            raise ValueError(f"hidden_ratio must be finite and in (0, 1], got {hidden_ratio!r}.")
+        try:
+            finite_hidden_ratio = math.isfinite(hidden_ratio)
+        except TypeError as error:
+            raise ValueError(f"hidden_ratio must be finite and in (0, 1], got {hidden_ratio!r}.") from error
+        if not finite_hidden_ratio or not 0 < hidden_ratio <= 1:
+            raise ValueError(f"hidden_ratio must be finite and in (0, 1], got {hidden_ratio!r}.")
+        for name, value in (
+            ("min_hidden", min_hidden),
+            ("max_hidden", max_hidden),
+            ("strip_kernel", strip_kernel),
+            ("context_dilation", context_dilation),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"{name} must be an integer, got {value!r}.")
+        if min_hidden <= 0:
+            raise ValueError(f"min_hidden must be positive, got {min_hidden}.")
+        if max_hidden < min_hidden:
+            raise ValueError(f"max_hidden must be at least min_hidden, got {max_hidden} < {min_hidden}.")
+        if strip_kernel < 3 or strip_kernel % 2 == 0:
+            raise ValueError(f"strip_kernel must be an odd integer of at least 3, got {strip_kernel}.")
+        if context_dilation < 1:
+            raise ValueError(f"context_dilation must be at least 1, got {context_dilation}.")
+        if isinstance(gate_max, bool):
+            raise ValueError(f"gate_max must be finite and positive, got {gate_max!r}.")
+        try:
+            finite_gate_max = math.isfinite(gate_max)
+        except TypeError as error:
+            raise ValueError(f"gate_max must be finite and positive, got {gate_max!r}.") from error
+        if not finite_gate_max or gate_max <= 0:
+            raise ValueError(f"gate_max must be finite and positive, got {gate_max!r}.")
+        if not isinstance(trainable_adapter, bool):
+            raise ValueError(f"trainable_adapter must be bool, got {trainable_adapter!r}.")
+
+        hidden = int(channels * hidden_ratio)
+        hidden = max(hidden, min_hidden)
+        hidden = min(hidden, max_hidden)
+        hidden = make_divisible(hidden, 8)
+        hidden = min(hidden, channels)
+
+        self.channels = channels
+        self.hidden = hidden
+        self.hidden_ratio = float(hidden_ratio)
+        self.strip_kernel = strip_kernel
+        self.context_dilation = context_dilation
+        self.gate_max = float(gate_max)
+        self.trainable_adapter = trainable_adapter
+        self.reduce = Conv(channels, hidden, k=1, s=1)
+        self.local_branch = DWConv(hidden, hidden, k=3, s=1, d=1)
+        self.horizontal_branch = DWConv(hidden, hidden, k=(1, strip_kernel), s=1, d=1)
+        self.vertical_branch = DWConv(hidden, hidden, k=(strip_kernel, 1), s=1, d=1)
+        self.context_branch = DWConv(hidden, hidden, k=3, s=1, d=context_dilation)
+        self.router = nn.Conv2d(hidden, 4, kernel_size=1, stride=1, padding=0, bias=True)
+        self.project = Conv(hidden, channels, k=1, s=1, act=False)
+        self.gate_raw = nn.Parameter(torch.zeros(()))
+        nn.init.zeros_(self.router.weight)
+        nn.init.zeros_(self.router.bias)
+        if not trainable_adapter:
+            self.requires_grad_(False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return an identity bypass or a zero-gated morphology-adaptive residual."""
+        if not self.trainable_adapter:
+            return x
+
+        reduced = self.reduce(x)
+        branches = torch.stack(
+            (
+                self.local_branch(reduced),
+                self.horizontal_branch(reduced),
+                self.vertical_branch(reduced),
+                self.context_branch(reduced),
+            ),
+            dim=1,
+        )
+        routing_weights = self.router(reduced).softmax(dim=1).unsqueeze(2)
+        mixed = (branches * routing_weights).sum(dim=1)
+        residual = self.project(mixed)
+        alpha = self.gate_max * torch.tanh(self.gate_raw)
+        return x + alpha.to(dtype=x.dtype) * residual
+
+
+class SpatialMorphologyClassificationAdapter(MorphologyAdaptiveAdapter):
+    """Spatially gated morphology adapter for classification features only."""
+
+    def __init__(
+        self,
+        channels: int,
+        hidden_ratio: float = 0.125,
+        min_hidden: int = 16,
+        max_hidden: int = 96,
+        strip_kernel: int = 7,
+        context_dilation: int = 2,
+        gate_max: float = 0.5,
+        trainable_adapter: bool = True,
+    ):
+        """Initialize morphology experts with a zero-initialized spatial residual gate."""
+        super().__init__(
+            channels=channels,
+            hidden_ratio=hidden_ratio,
+            min_hidden=min_hidden,
+            max_hidden=max_hidden,
+            strip_kernel=strip_kernel,
+            context_dilation=context_dilation,
+            gate_max=gate_max,
+            trainable_adapter=trainable_adapter,
+        )
+        del self.gate_raw
+        self.spatial_gate = nn.Conv2d(self.hidden, 1, kernel_size=1, stride=1, padding=0, bias=True)
+        nn.init.zeros_(self.spatial_gate.weight)
+        nn.init.zeros_(self.spatial_gate.bias)
+        if not trainable_adapter:
+            self.spatial_gate.requires_grad_(False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return an identity bypass or a spatially gated morphology residual."""
+        if not self.trainable_adapter:
+            return x
+
+        reduced = self.reduce(x)
+        branches = torch.stack(
+            (
+                self.local_branch(reduced),
+                self.horizontal_branch(reduced),
+                self.vertical_branch(reduced),
+                self.context_branch(reduced),
+            ),
+            dim=1,
+        )
+        routing_weights = self.router(reduced).softmax(dim=1).unsqueeze(2)
+        mixed = (branches * routing_weights).sum(dim=1)
+        residual = self.project(mixed)
+        gate = self.gate_max * torch.tanh(self.spatial_gate(reduced))
+        return x + gate.to(dtype=x.dtype) * residual
 
 
 class Detect(nn.Module):
@@ -261,6 +421,168 @@ class Detect(nn.Module):
     def fuse(self) -> None:
         """Remove the one2many head for inference optimization."""
         self.cv2 = self.cv3 = None
+
+
+class MorphologyAdaptiveDetect(Detect):
+    """YOLO Detect head with independent zero-gated morphology adapters."""
+
+    def __init__(
+        self,
+        nc: int = 80,
+        hidden_ratio: float = 0.125,
+        min_hidden: int = 16,
+        max_hidden: int = 96,
+        strip_kernel: int = 7,
+        context_dilation: int = 2,
+        gate_max: float = 0.5,
+        trainable_adapters: bool = True,
+        reg_max: int = 1,
+        end2end: bool = False,
+        ch: tuple = (),
+    ):
+        """Initialize stock detection towers and independent box/class adapters."""
+        super().__init__(nc=nc, reg_max=reg_max, end2end=end2end, ch=ch)
+        adapter_args = {
+            "hidden_ratio": hidden_ratio,
+            "min_hidden": min_hidden,
+            "max_hidden": max_hidden,
+            "strip_kernel": strip_kernel,
+            "context_dilation": context_dilation,
+            "gate_max": gate_max,
+            "trainable_adapter": trainable_adapters,
+        }
+        self.box_adapters = nn.ModuleList(MorphologyAdaptiveAdapter(c, **adapter_args) for c in ch)
+        self.cls_adapters = nn.ModuleList(MorphologyAdaptiveAdapter(c, **adapter_args) for c in ch)
+        if end2end:
+            self.one2one_box_adapters = copy.deepcopy(self.box_adapters)
+            self.one2one_cls_adapters = copy.deepcopy(self.cls_adapters)
+
+    def forward_head(
+        self,
+        x: list[torch.Tensor],
+        box_head: torch.nn.Module = None,
+        cls_head: torch.nn.Module = None,
+        box_adapters: torch.nn.Module = None,
+        cls_adapters: torch.nn.Module = None,
+    ) -> dict[str, torch.Tensor]:
+        """Run independent box/class adapters before unchanged stock towers."""
+        if box_head is None or cls_head is None:
+            return {}
+        if box_adapters is None or cls_adapters is None:
+            raise RuntimeError("MorphologyAdaptiveDetect requires box and classification adapters.")
+        bs = x[0].shape[0]
+        boxes = torch.cat(
+            [
+                box_head[i](box_adapters[i](x[i])).view(bs, 4 * self.reg_max, -1)
+                for i in range(self.nl)
+            ],
+            dim=-1,
+        )
+        scores = torch.cat(
+            [cls_head[i](cls_adapters[i](x[i])).view(bs, self.nc, -1) for i in range(self.nl)],
+            dim=-1,
+        )
+        return {"boxes": boxes, "scores": scores, "feats": x}
+
+    def forward(
+        self, x: list[torch.Tensor]
+    ) -> dict[str, torch.Tensor] | torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Return stock-format predictions from morphology-adapted features."""
+        preds = self.forward_head(x, self.cv2, self.cv3, self.box_adapters, self.cls_adapters)
+        if self.end2end:
+            x_detach = [xi.detach() for xi in x]
+            one2one = self.forward_head(
+                x_detach,
+                self.one2one_cv2,
+                self.one2one_cv3,
+                self.one2one_box_adapters,
+                self.one2one_cls_adapters,
+            )
+            preds = {"one2many": preds, "one2one": one2one}
+        if self.training:
+            return preds
+        y = self._inference(preds["one2one"] if self.end2end else preds)
+        if self.end2end:
+            y = self.postprocess(y.permute(0, 2, 1))
+        return y if self.export else (y, preds)
+
+
+class GeometryPreservingSpatialMorphologyDetect(Detect):
+    """YOLO Detect head with shared spatial morphology adaptation only for classification."""
+
+    def __init__(
+        self,
+        nc: int = 80,
+        hidden_ratio: float = 0.125,
+        min_hidden: int = 16,
+        max_hidden: int = 96,
+        strip_kernel: int = 7,
+        context_dilation: int = 2,
+        gate_max: float = 0.5,
+        trainable_adapters: bool = True,
+        reg_max: int = 1,
+        end2end: bool = False,
+        ch: tuple = (),
+    ):
+        """Initialize stock detection towers and shared classification-only adapters."""
+        super().__init__(nc=nc, reg_max=reg_max, end2end=end2end, ch=ch)
+        self.cls_adapters = nn.ModuleList(
+            SpatialMorphologyClassificationAdapter(
+                channels=c,
+                hidden_ratio=hidden_ratio,
+                min_hidden=min_hidden,
+                max_hidden=max_hidden,
+                strip_kernel=strip_kernel,
+                context_dilation=context_dilation,
+                gate_max=gate_max,
+                trainable_adapter=trainable_adapters,
+            )
+            for c in ch
+        )
+
+    def forward_head(
+        self,
+        x: list[torch.Tensor],
+        cls_features: list[torch.Tensor],
+        box_head: torch.nn.Module = None,
+        cls_head: torch.nn.Module = None,
+    ) -> dict[str, torch.Tensor]:
+        """Run stock box towers on original features and class towers on adapted features."""
+        if box_head is None or cls_head is None:
+            return {}
+        bs = x[0].shape[0]
+        boxes = torch.cat(
+            [box_head[i](x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)],
+            dim=-1,
+        )
+        scores = torch.cat(
+            [cls_head[i](cls_features[i]).view(bs, self.nc, -1) for i in range(self.nl)],
+            dim=-1,
+        )
+        return {"boxes": boxes, "scores": scores, "feats": x}
+
+    def forward(
+        self, x: list[torch.Tensor]
+    ) -> dict[str, torch.Tensor] | torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Return stock-format predictions with shared classification morphology semantics."""
+        cls_features = [adapter(feature) for adapter, feature in zip(self.cls_adapters, x)]
+        preds = self.forward_head(x, cls_features, self.cv2, self.cv3)
+        if self.end2end:
+            x_detach = [feature.detach() for feature in x]
+            cls_features_detach = [feature.detach() for feature in cls_features]
+            one2one = self.forward_head(
+                x_detach,
+                cls_features_detach,
+                self.one2one_cv2,
+                self.one2one_cv3,
+            )
+            preds = {"one2many": preds, "one2one": one2one}
+        if self.training:
+            return preds
+        y = self._inference(preds["one2one"] if self.end2end else preds)
+        if self.end2end:
+            y = self.postprocess(y.permute(0, 2, 1))
+        return y if self.export else (y, preds)
 
 
 class Segment(Detect):
