@@ -16,6 +16,7 @@ from yolo_improved import (  # noqa: E402
     ClassBalancedPositiveConfig,
     ClassBalancedYOLO,
     calculate_class_balanced_positive_weights,
+    calculate_effective_number_weights,
     count_yolo_class_instances,
     get_class_balanced_positive_config,
 )
@@ -34,6 +35,7 @@ DEFAULT_DATA_YAML = (
 PROJECT_DIRECTORIES = {
     "control": REPOSITORY_ROOT / "runs" / "e4-control" / "roboflow-v1",
     "effective-099": REPOSITORY_ROOT / "runs" / "e4-class-balanced-positive-beta099" / "roboflow-v1",
+    "uplift-025": REPOSITORY_ROOT / "runs" / "e4-1a-positive-uplift-025" / "roboflow-v1",
 }
 
 
@@ -113,7 +115,7 @@ def parse_arguments() -> argparse.Namespace:
         "--variant",
         choices=CLASS_BALANCED_POSITIVE_MODES,
         required=True,
-        help="Варіант E4: control або effective-099.",
+        help="Варіант E4: control, effective-099 або uplift-025.",
     )
     return parser.parse_args()
 
@@ -122,8 +124,22 @@ def print_class_balance_table(
     class_names: tuple[str, ...],
     class_counts: tuple[int, ...],
     positive_class_weights: torch.Tensor,
+    effective_class_weights: torch.Tensor | None = None,
 ) -> None:
     """Print training counts and display-only rounded positive weights."""
+    if effective_class_weights is not None:
+        print("class_id | class_name | count | effective_weight | final_uplift_weight")
+        for class_id, (class_name, count, effective_weight, final_weight) in enumerate(
+            zip(
+                class_names,
+                class_counts,
+                effective_class_weights.tolist(),
+                positive_class_weights.tolist(),
+            )
+        ):
+            print(f"{class_id} | {class_name} | {count} | {effective_weight:.10f} | {final_weight:.10f}")
+        return
+
     print("class_id | class_name | instance_count | positive_weight")
     for class_id, (class_name, count, weight) in enumerate(
         zip(class_names, class_counts, positive_class_weights.tolist())
@@ -177,10 +193,14 @@ def train_model(
 
     print()
     print("=" * 80)
-    print("E4: class-balanced positive classification")
-    print("Локалізація: E1.1 constant-010")
-    print("Класифікація: E2.1b")
-    print("Class balancing: positive elements only")
+    if variant == "uplift-025":
+        print("E4.1a: positive-only class uplift")
+        print("Base supervision: E1.1 constant-010 + E2.1b")
+    else:
+        print("E4: class-balanced positive classification")
+        print("Локалізація: E1.1 constant-010")
+        print("Класифікація: E2.1b")
+        print("Class balancing: positive elements only")
     print(f"Варіант: {variant}")
     print(f"Початок навчання: {model_name}")
     print(f"Набір даних: {data_yaml}")
@@ -242,21 +262,43 @@ def main() -> None:
         class_counts,
         config=class_balanced_config,
     )
+    effective_class_weights = (
+        calculate_effective_number_weights(
+            class_counts,
+            beta=class_balanced_config.beta,
+            eps=class_balanced_config.eps,
+        )
+        if args.variant == "uplift-025"
+        else None
+    )
     project_directory.mkdir(parents=True, exist_ok=True)
 
-    print("E4: class-balanced positive classification")
-    print("Локалізація: E1.1 constant-010")
-    print("Класифікація: E2.1b")
-    print("Class balancing: positive elements only")
-    print(f"Варіант: {args.variant}")
-    print(f"beta: {class_balanced_config.beta}")
+    if args.variant == "uplift-025":
+        print("E4.1a: positive-only class uplift")
+        print("Base supervision: E1.1 constant-010 + E2.1b")
+        print(f"beta: {class_balanced_config.beta}")
+        print(f"uplift_strength: {class_balanced_config.uplift_strength}")
+        print(f"minimum weight: {class_balanced_config.min_weight}")
+        print(f"maximum weight: {class_balanced_config.max_weight}")
+    else:
+        print("E4: class-balanced positive classification")
+        print("Локалізація: E1.1 constant-010")
+        print("Класифікація: E2.1b")
+        print("Class balancing: positive elements only")
+        print(f"Варіант: {args.variant}")
+        print(f"beta: {class_balanced_config.beta}")
     print(f"eps: {class_balanced_config.eps}")
     print("Масштаб NWD E1.1: 0.10")
     print(f"E2.1b contrast_tau: {E2_1B_CONFIG.contrast_tau}")
     print(f"E2.1b positive_gain: {E2_1B_CONFIG.positive_gain}")
     print(f"E2.1b negative_gain: {E2_1B_CONFIG.negative_gain}")
     print(f"E2.1b negative_gamma: {E2_1B_CONFIG.negative_gamma}")
-    print_class_balance_table(class_names, class_counts, positive_class_weights)
+    print_class_balance_table(
+        class_names,
+        class_counts,
+        positive_class_weights,
+        effective_class_weights=effective_class_weights,
+    )
     print(f"Каталог результатів: {project_directory}")
     print(f"PyTorch: {torch.__version__}")
     print(f"CUDA у PyTorch: {torch.version.cuda}")

@@ -12,7 +12,7 @@ from ultralytics.data.utils import IMG_FORMATS, img2label_paths
 from ultralytics.utils import DATASETS_DIR
 
 
-CLASS_BALANCED_POSITIVE_MODES = ("control", "effective-099")
+CLASS_BALANCED_POSITIVE_MODES = ("control", "effective-099", "uplift-025")
 
 
 @dataclass(frozen=True)
@@ -21,13 +21,16 @@ class ClassBalancedPositiveConfig:
 
     mode: str = "effective-099"
     beta: float = 0.99
+    uplift_strength: float = 0.25
+    min_weight: float = 1.0
+    max_weight: float = 1.25
     eps: float = 1e-12
 
     def __post_init__(self) -> None:
         """Validate the fixed E4 modes and effective-number coefficients."""
         if self.mode not in CLASS_BALANCED_POSITIVE_MODES:
             raise ValueError(f"mode must be one of {CLASS_BALANCED_POSITIVE_MODES}, got {self.mode!r}.")
-        for name in ("beta", "eps"):
+        for name in ("beta", "uplift_strength", "min_weight", "max_weight", "eps"):
             value = getattr(self, name)
             if isinstance(value, bool):
                 raise ValueError(f"{name} must be a finite number, got {value!r}.")
@@ -39,10 +42,28 @@ class ClassBalancedPositiveConfig:
                 raise ValueError(f"{name} must be finite, got {value!r}.")
         if not 0 <= self.beta < 1:
             raise ValueError(f"beta must be in [0, 1), got {self.beta}.")
-        if self.mode == "effective-099" and self.beta != 0.99:
-            raise ValueError(f"effective-099 requires beta=0.99, got {self.beta}.")
+        if self.uplift_strength < 0:
+            raise ValueError(f"uplift_strength must be nonnegative, got {self.uplift_strength}.")
+        if self.min_weight <= 0:
+            raise ValueError(f"min_weight must be positive, got {self.min_weight}.")
+        if self.max_weight < self.min_weight:
+            raise ValueError(
+                f"max_weight must be at least min_weight, got {self.max_weight} < {self.min_weight}."
+            )
         if self.eps <= 0:
             raise ValueError(f"eps must be positive, got {self.eps}.")
+        if self.mode in {"effective-099", "uplift-025"} and self.beta != 0.99:
+            raise ValueError(f"{self.mode} requires beta=0.99, got {self.beta}.")
+        if self.mode == "uplift-025":
+            fixed_values = {
+                "uplift_strength": 0.25,
+                "min_weight": 1.0,
+                "max_weight": 1.25,
+            }
+            for name, expected in fixed_values.items():
+                value = getattr(self, name)
+                if value != expected:
+                    raise ValueError(f"uplift-025 requires {name}={expected}, got {value}.")
 
 
 def resolve_class_balanced_positive_config(
@@ -62,7 +83,7 @@ def resolve_class_balanced_positive_config(
 
 
 def get_class_balanced_positive_config(mode: str) -> ClassBalancedPositiveConfig:
-    """Return one of the two fixed E4 experiment configurations."""
+    """Return one of the fixed E4 experiment configurations."""
     return ClassBalancedPositiveConfig(mode=mode)
 
 
@@ -246,8 +267,9 @@ def validate_positive_class_weights(
     weights: torch.Tensor | Sequence[float],
     number_of_classes: int | None = None,
     eps: float = 1e-12,
+    require_mean_one: bool = True,
 ) -> torch.Tensor:
-    """Return detached CPU float64 positive weights after shape and normalization checks."""
+    """Return detached CPU float64 positive weights after shape and optional normalization checks."""
     if weights is None:
         raise ValueError("positive class weights are required.")
     try:
@@ -264,7 +286,12 @@ def validate_positive_class_weights(
         )
     if not torch.isfinite(weights_tensor).all() or not torch.all(weights_tensor > 0):
         raise ValueError("all positive class weights must be finite and greater than zero.")
-    if not math.isclose(weights_tensor.mean().item(), 1.0, rel_tol=0.0, abs_tol=max(eps, 1e-12)):
+    if require_mean_one and not math.isclose(
+        weights_tensor.mean().item(),
+        1.0,
+        rel_tol=0.0,
+        abs_tol=max(eps, 1e-12),
+    ):
         raise ValueError(f"positive class weights must have mean 1, got {weights_tensor.mean().item()}.")
     return weights_tensor.clone()
 
@@ -274,12 +301,13 @@ def validate_class_balanced_positive_weights(
     config: ClassBalancedPositiveConfig | dict | None = None,
     number_of_classes: int | None = None,
 ) -> torch.Tensor:
-    """Validate normalized E4 weights and require unit weights in control mode."""
+    """Validate E4 weights while preserving the constraints of each fixed mode."""
     config = resolve_class_balanced_positive_config(config)
     weights_tensor = validate_positive_class_weights(
         weights,
         number_of_classes=number_of_classes,
         eps=config.eps,
+        require_mean_one=config.mode != "uplift-025",
     )
     if config.mode == "control" and not torch.allclose(
         weights_tensor,
@@ -288,6 +316,11 @@ def validate_class_balanced_positive_weights(
         atol=config.eps,
     ):
         raise ValueError("E4 control mode requires all positive class weights to equal one.")
+    if config.mode == "uplift-025":
+        if not torch.all(weights_tensor >= config.min_weight):
+            raise ValueError(f"uplift-025 positive class weights must be at least {config.min_weight}.")
+        if not torch.all(weights_tensor <= config.max_weight):
+            raise ValueError(f"uplift-025 positive class weights must be at most {config.max_weight}.")
     return weights_tensor
 
 
@@ -334,15 +367,62 @@ def calculate_effective_number_weights(
     return validate_positive_class_weights(normalized, number_of_classes=counts.numel(), eps=eps)
 
 
+def calculate_positive_uplift_weights(
+    effective_weights: torch.Tensor | Sequence[float],
+    uplift_strength: float = 0.25,
+    min_weight: float = 1.0,
+    max_weight: float = 1.25,
+) -> torch.Tensor:
+    """Apply bounded positive uplift to normalized effective-number weights."""
+    for name, value in (
+        ("uplift_strength", uplift_strength),
+        ("min_weight", min_weight),
+        ("max_weight", max_weight),
+    ):
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be a finite number, got {value!r}.")
+        try:
+            finite = math.isfinite(value)
+        except TypeError as error:
+            raise ValueError(f"{name} must be a finite number, got {value!r}.") from error
+        if not finite:
+            raise ValueError(f"{name} must be finite, got {value!r}.")
+    if uplift_strength < 0:
+        raise ValueError(f"uplift_strength must be nonnegative, got {uplift_strength}.")
+    if min_weight <= 0:
+        raise ValueError(f"min_weight must be positive, got {min_weight}.")
+    if max_weight < min_weight:
+        raise ValueError(f"max_weight must be at least min_weight, got {max_weight} < {min_weight}.")
+
+    effective_weights = validate_positive_class_weights(effective_weights)
+    final_weights = 1.0 + uplift_strength * torch.clamp(effective_weights - 1.0, min=0.0)
+    final_weights = final_weights.clamp(min=min_weight, max=max_weight)
+    return validate_positive_class_weights(
+        final_weights,
+        number_of_classes=effective_weights.numel(),
+        require_mean_one=False,
+    )
+
+
 def calculate_class_balanced_positive_weights(
     class_counts: Sequence[int] | torch.Tensor,
     config: ClassBalancedPositiveConfig | dict | None = None,
 ) -> torch.Tensor:
-    """Return fixed control weights or effective-099 weights for E4."""
+    """Return positive-only class weights for one fixed E4 mode."""
     config = resolve_class_balanced_positive_config(config)
     counts = _validate_class_counts(class_counts)
     if config.mode == "control":
         weights = torch.ones(counts.numel(), dtype=torch.float64)
     else:
-        weights = calculate_effective_number_weights(counts, beta=config.beta, eps=config.eps)
+        effective_weights = calculate_effective_number_weights(counts, beta=config.beta, eps=config.eps)
+        weights = (
+            effective_weights
+            if config.mode == "effective-099"
+            else calculate_positive_uplift_weights(
+                effective_weights,
+                uplift_strength=config.uplift_strength,
+                min_weight=config.min_weight,
+                max_weight=config.max_weight,
+            )
+        )
     return validate_class_balanced_positive_weights(weights, config=config, number_of_classes=counts.numel())

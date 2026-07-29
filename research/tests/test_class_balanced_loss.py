@@ -22,10 +22,12 @@ from yolo_improved import (
     ClassBalancedPositiveConfig,
     ClassBalancedYOLO,
     ContrastRingDetectionModel,
+    ContrastRingLossConfig,
     MutualDistillationYOLO,
     OneWayDistillationYOLO,
     calculate_class_balanced_positive_weights,
     calculate_effective_number_weights,
+    calculate_positive_uplift_weights,
     count_yolo_class_instances,
     get_class_balanced_positive_config,
 )
@@ -78,16 +80,28 @@ def _synthetic_batch() -> dict[str, torch.Tensor]:
 
 def test_class_balanced_config_modes_and_validation() -> None:
     """Check fixed E4 modes and reject invalid values."""
-    assert CLASS_BALANCED_POSITIVE_MODES == ("control", "effective-099")
+    assert CLASS_BALANCED_POSITIVE_MODES == ("control", "effective-099", "uplift-025")
     assert get_class_balanced_positive_config("control") == ClassBalancedPositiveConfig(mode="control")
     assert get_class_balanced_positive_config("effective-099") == ClassBalancedPositiveConfig()
+    assert get_class_balanced_positive_config("uplift-025") == ClassBalancedPositiveConfig(mode="uplift-025")
     for kwargs in (
         {"mode": "unknown"},
         {"beta": -0.1},
         {"beta": 1.0},
         {"beta": float("inf")},
         {"mode": "effective-099", "beta": 0.98},
+        {"mode": "uplift-025", "beta": 0.98},
+        {"uplift_strength": -0.1},
+        {"uplift_strength": float("inf")},
+        {"min_weight": 0},
+        {"min_weight": float("nan")},
+        {"min_weight": 1.2, "max_weight": 1.1},
+        {"max_weight": float("inf")},
+        {"mode": "uplift-025", "uplift_strength": 0.5},
+        {"mode": "uplift-025", "min_weight": 0.9},
+        {"mode": "uplift-025", "max_weight": 1.5},
         {"eps": 0},
+        {"eps": float("nan")},
     ):
         with pytest.raises(ValueError):
             ClassBalancedPositiveConfig(**kwargs)
@@ -202,6 +216,51 @@ def test_effective_number_weights_are_float64_normalized_and_favor_rare_classes(
         calculate_class_balanced_positive_weights(counts, ClassBalancedPositiveConfig(mode="control")),
         torch.ones(3, dtype=torch.float64),
     )
+    torch.testing.assert_close(
+        calculate_class_balanced_positive_weights(
+            counts,
+            ClassBalancedPositiveConfig(mode="effective-099"),
+        ),
+        weights,
+        atol=0,
+        rtol=0,
+    )
+
+
+def test_positive_uplift_weights_match_expected_values_and_bounds() -> None:
+    """Check E4.1a uplift values, common-class floor, rare-class ceiling, and automatic calculation."""
+    counts = [62, 16, 11]
+    effective_weights = calculate_effective_number_weights(counts, beta=0.99)
+    final_weights = calculate_positive_uplift_weights(
+        effective_weights,
+        uplift_strength=0.25,
+        min_weight=1.0,
+        max_weight=1.25,
+    )
+    calculated_weights = calculate_class_balanced_positive_weights(
+        counts,
+        ClassBalancedPositiveConfig(mode="uplift-025"),
+    )
+
+    torch.testing.assert_close(final_weights, calculated_weights, atol=0, rtol=0)
+    torch.testing.assert_close(
+        final_weights,
+        torch.tensor([1.0, 1.0237646638, 1.1385432358], dtype=torch.float64),
+        atol=5e-10,
+        rtol=0,
+    )
+    assert effective_weights[0] < 1
+    assert final_weights[0].item() == 1.0
+    assert torch.all(final_weights >= 1.0)
+    assert torch.all(final_weights <= 1.25)
+
+    capped_weights = calculate_positive_uplift_weights([0.01, 0.01, 2.98])
+    assert capped_weights[-1].item() == 1.25
+    uplift_config = ClassBalancedPositiveConfig(mode="uplift-025")
+    with pytest.raises(ValueError, match="at least"):
+        validate_class_balanced_positive_weights([0.99, 1.01], config=uplift_config)
+    with pytest.raises(ValueError, match="at most"):
+        validate_class_balanced_positive_weights([1.0, 1.26], config=uplift_config)
 
 
 def test_positive_weights_preserve_float64_precision_across_trainer_list_transport() -> None:
@@ -233,9 +292,15 @@ def test_positive_weights_change_only_positive_e2_1b_elements_and_support_amp() 
     balanced_loss = balanced(logits, targets)
     positive_mask = targets > 0
     expected_multiplier = torch.where(positive_mask, weights.view(1, 1, -1).float(), torch.tensor(1.0))
+    raw_bce = torch.nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    probability = logits.detach().sigmoid()
+    positive_weight = 1.0 + 0.25 * (1.0 - contrast)
+    negative_weight = 1.0 + 0.25 * contrast * probability.pow(3.0)
+    expected_base_loss = raw_bce * torch.where(positive_mask, positive_weight, negative_weight)
 
     assert balanced.positive_class_weights.shape == (1, 1, 2)
     assert balanced.positive_class_weights.dtype == torch.float64
+    torch.testing.assert_close(base_loss, expected_base_loss)
     torch.testing.assert_close(balanced_loss, base_loss * expected_multiplier)
     torch.testing.assert_close(balanced_loss[~positive_mask], base_loss[~positive_mask])
 
@@ -275,6 +340,15 @@ def test_e4_disables_stock_global_class_weights_and_reuses_fixed_e2_1b() -> None
     assert isinstance(criterion, E2ELoss)
     assert E2_LOCALIZATION_CONFIG.mode == "constant-010"
     assert E2_LOCALIZATION_CONFIG.nwd_scale == 0.10
+    assert E2_1B_CONFIG == ContrastRingLossConfig(
+        inner_kernel=3,
+        outer_kernel=7,
+        contrast_tau=0.25,
+        positive_gain=0.25,
+        negative_gain=0.25,
+        negative_gamma=3.0,
+        eps=1e-6,
+    )
     for branch in (criterion.one2many, criterion.one2one):
         assert isinstance(branch, ClassBalancedContrastRingDetectionLoss)
         assert branch.class_weights is None
@@ -317,9 +391,10 @@ def test_e4_control_reproduces_full_e2_1b_loss() -> None:
         torch.testing.assert_close(e4_items[name], e2_items[name], atol=1e-6, rtol=1e-6)
 
 
-def test_e2_1b_and_e4_architectures_and_standard_state_dict_match() -> None:
-    """Compare parameter/state shapes and strictly load a standard YOLO26 state dict."""
-    standard = YOLO(str(REPOSITORY_ROOT / "yolo26n.pt")).model
+def test_e2_1b_e4_and_e4_1a_architectures_and_standard_loading_match(tmp_path: Path) -> None:
+    """Compare architectures and load E4.1a weights through the standard YOLO facade."""
+    standard_facade = YOLO(str(REPOSITORY_ROOT / "yolo26n.pt"))
+    standard = standard_facade.model
     channels = standard.yaml.get("channels") or 3
     number_of_classes = standard.model[-1].nc
     model_yaml = copy.deepcopy(standard.yaml)
@@ -338,17 +413,34 @@ def test_e2_1b_and_e4_architectures_and_standard_state_dict_match() -> None:
         positive_class_weights=torch.ones(number_of_classes),
         class_balanced_config=ClassBalancedPositiveConfig(mode="control"),
     )
+    uplift_weights = calculate_class_balanced_positive_weights(
+        torch.arange(1, number_of_classes + 1),
+        ClassBalancedPositiveConfig(mode="uplift-025"),
+    )
+    e4_1a_model = ClassBalancedDetectionModel(
+        copy.deepcopy(model_yaml),
+        ch=channels,
+        nc=number_of_classes,
+        verbose=False,
+        positive_class_weights=uplift_weights,
+        class_balanced_config=ClassBalancedPositiveConfig(mode="uplift-025"),
+    )
 
     e2_parameters = [(name, tuple(parameter.shape)) for name, parameter in e2_model.named_parameters()]
     e4_parameters = [(name, tuple(parameter.shape)) for name, parameter in e4_model.named_parameters()]
+    e4_1a_parameters = [(name, tuple(parameter.shape)) for name, parameter in e4_1a_model.named_parameters()]
     e2_state = {name: tuple(tensor.shape) for name, tensor in e2_model.state_dict().items()}
     e4_state = {name: tuple(tensor.shape) for name, tensor in e4_model.state_dict().items()}
+    e4_1a_state = {name: tuple(tensor.shape) for name, tensor in e4_1a_model.state_dict().items()}
     assert e4_parameters == e2_parameters
+    assert e4_1a_parameters == e2_parameters
     assert e4_state == e2_state
+    assert e4_1a_state == e2_state
 
-    incompatible = e4_model.load_state_dict(standard.state_dict(), strict=True)
-    assert incompatible.missing_keys == []
-    assert incompatible.unexpected_keys == []
+    for experimental_model in (e4_model, e4_1a_model):
+        incompatible = experimental_model.load_state_dict(standard.state_dict(), strict=True)
+        assert incompatible.missing_keys == []
+        assert incompatible.unexpected_keys == []
     facade = ClassBalancedYOLO(
         str(REPOSITORY_ROOT / "yolo26n.pt"),
         positive_class_weights=torch.ones(number_of_classes),
@@ -358,3 +450,11 @@ def test_e2_1b_and_e4_architectures_and_standard_state_dict_match() -> None:
     assert facade.model.class_weights is None
     assert MutualDistillationYOLO is not ClassBalancedYOLO
     assert OneWayDistillationYOLO is not ClassBalancedYOLO
+
+    checkpoint = tmp_path / "e4-1a.pt"
+    standard_facade.model = e4_1a_model
+    standard_facade.save(checkpoint)
+    loaded = YOLO(checkpoint)
+    assert isinstance(loaded.model, ClassBalancedDetectionModel)
+    assert loaded.model.class_balanced_positive_config.mode == "uplift-025"
+    torch.testing.assert_close(loaded.model.positive_class_weights, uplift_weights)

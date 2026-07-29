@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -37,6 +39,7 @@ __all__ = (
     "C2fPSA",
     "C3Ghost",
     "C3k2",
+    "C3k2RMSR",
     "C3x",
     "CBFuse",
     "CBLinear",
@@ -1105,6 +1108,84 @@ class C3k2(C2f):
             else Bottleneck(self.c, self.c, shortcut, g)
             for _ in range(n)
         )
+
+
+class C3k2RMSR(nn.Module):
+    """C3k2 with gated residual multi-scale depthwise refinement."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = True,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+        gate_max: float = 1.0,
+        trainable_refinement: bool = True,
+    ):
+        """Initialize a C3k2 base and zero-gated local/context refinement branches.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            n (int): Number of C3k2 blocks.
+            c3k (bool): Whether to use C3k blocks in the base module.
+            e (float): Base-module expansion ratio.
+            attn (bool): Whether to use attention blocks in the base module.
+            g (int): Base-module convolution groups.
+            shortcut (bool): Whether to use base-module shortcut connections.
+            gate_max (float): Positive maximum absolute residual-gate value.
+            trainable_refinement (bool): Whether to evaluate and optimize the refinement path.
+        """
+        super().__init__()
+        if isinstance(gate_max, bool):
+            raise ValueError(f"gate_max must be a finite positive number, got {gate_max!r}.")
+        try:
+            gate_max = float(gate_max)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"gate_max must be a finite positive number, got {gate_max!r}.") from error
+        if not math.isfinite(gate_max) or gate_max <= 0:
+            raise ValueError(f"gate_max must be finite and positive, got {gate_max!r}.")
+        if not isinstance(trainable_refinement, bool):
+            raise ValueError(f"trainable_refinement must be a bool, got {trainable_refinement!r}.")
+
+        self.base = C3k2(
+            c1=c1,
+            c2=c2,
+            n=n,
+            c3k=c3k,
+            e=e,
+            attn=attn,
+            g=g,
+            shortcut=shortcut,
+        )
+        self.local_branch = DWConv(c1=c2, c2=c2, k=3, s=1, d=1, act=True)
+        self.context_branch = DWConv(c1=c2, c2=c2, k=3, s=1, d=2, act=True)
+        self.fusion = Conv(c1=2 * c2, c2=c2, k=1, s=1, act=False)
+        self.gate_max = gate_max
+        self.trainable_refinement = trainable_refinement
+        if trainable_refinement:
+            self.gate_raw = nn.Parameter(torch.zeros(()))
+        else:
+            self.register_buffer("gate_raw", torch.zeros(()))
+            self.local_branch.requires_grad_(False)
+            self.context_branch.requires_grad_(False)
+            self.fusion.requires_grad_(False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the base C3k2 and optional zero-gated residual refinement."""
+        base = self.base(x)
+        if not self.trainable_refinement:
+            return base
+
+        local = self.local_branch(base)
+        context = self.context_branch(base)
+        residual = self.fusion(torch.cat((local, context), dim=1))
+        alpha = self.gate_max * torch.tanh(self.gate_raw)
+        return base + alpha.to(dtype=base.dtype) * residual
 
 
 class C3k(C3):

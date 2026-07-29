@@ -23,9 +23,9 @@ class ClassBalancedContrastRingBCEWithLogitsLoss(ContrastRingBCEWithLogitsLoss):
         positive_class_weights: torch.Tensor | Sequence[float],
         config: ContrastRingLossConfig | dict | None = None,
     ):
-        """Register validated mean-one positive class weights without changing E2.1b."""
+        """Register validated positive class weights without changing E2.1b."""
         super().__init__(config=config)
-        weights = validate_positive_class_weights(positive_class_weights)
+        weights = validate_positive_class_weights(positive_class_weights, require_mean_one=False)
         self.register_buffer("positive_class_weights", weights.view(1, 1, -1))
 
     def forward(self, pred_scores: torch.Tensor, target_scores: torch.Tensor) -> torch.Tensor:
