@@ -23,9 +23,11 @@ from .utils import bias_init_with_prob, linear_init
 
 __all__ = (
     "OBB",
+    "BoxClassAgreementQualityHead",
     "Classify",
     "Depth",
     "Detect",
+    "DualGeometryQualityMorphologyDetect",
     "GeometryPreservingSpatialMorphologyDetect",
     "MorphologyAdaptiveAdapter",
     "MorphologyAdaptiveDetect",
@@ -139,6 +141,76 @@ class MorphologyAdaptiveAdapter(nn.Module):
         residual = self.project(mixed)
         alpha = self.gate_max * torch.tanh(self.gate_raw)
         return x + alpha.to(dtype=x.dtype) * residual
+
+
+class BoxClassAgreementQualityHead(nn.Module):
+    """Predict class-agnostic quality from detached box/class feature agreement."""
+
+    def __init__(
+        self,
+        channels: int,
+        hidden_ratio: float = 0.125,
+        min_hidden: int = 16,
+        max_hidden: int = 64,
+        trainable_quality: bool = True,
+    ):
+        """Initialize a compact zero-output quality head."""
+        super().__init__()
+        if not isinstance(channels, int) or isinstance(channels, bool) or channels <= 0:
+            raise ValueError(f"channels must be a positive integer, got {channels!r}.")
+        if isinstance(hidden_ratio, bool):
+            raise ValueError(f"hidden_ratio must be finite and positive, got {hidden_ratio!r}.")
+        try:
+            finite_hidden_ratio = math.isfinite(hidden_ratio)
+        except TypeError as error:
+            raise ValueError(f"hidden_ratio must be finite and positive, got {hidden_ratio!r}.") from error
+        if not finite_hidden_ratio or hidden_ratio <= 0:
+            raise ValueError(f"hidden_ratio must be finite and positive, got {hidden_ratio!r}.")
+        for name, value in (("min_hidden", min_hidden), ("max_hidden", max_hidden)):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"{name} must be an integer, got {value!r}.")
+        if min_hidden <= 0:
+            raise ValueError(f"min_hidden must be positive, got {min_hidden}.")
+        if max_hidden < min_hidden:
+            raise ValueError(f"max_hidden must be at least min_hidden, got {max_hidden} < {min_hidden}.")
+        if not isinstance(trainable_quality, bool):
+            raise ValueError(f"trainable_quality must be bool, got {trainable_quality!r}.")
+
+        hidden = int(channels * hidden_ratio)
+        hidden = max(hidden, min_hidden)
+        hidden = min(hidden, max_hidden)
+        hidden = make_divisible(hidden, 8)
+
+        self.channels = channels
+        self.hidden = hidden
+        self.hidden_ratio = float(hidden_ratio)
+        self.trainable_quality = trainable_quality
+        self.reduce = Conv(3 * channels, hidden, k=1, s=1)
+        self.context = DWConv(hidden, hidden, k=3, s=1, d=1)
+        self.output = nn.Conv2d(hidden, 1, kernel_size=1, stride=1, padding=0, bias=True)
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+        if not trainable_quality:
+            self.requires_grad_(False)
+
+    def forward(self, box_feature: torch.Tensor, cls_feature: torch.Tensor) -> torch.Tensor:
+        """Return a zero bypass or quality logits from box/class feature agreement."""
+        if not self.trainable_quality:
+            return box_feature.new_zeros((box_feature.shape[0], 1, *box_feature.shape[-2:]))
+        if box_feature.shape != cls_feature.shape:
+            raise ValueError(
+                f"box_feature and cls_feature must have identical shapes, got "
+                f"{tuple(box_feature.shape)} and {tuple(cls_feature.shape)}."
+            )
+        agreement = torch.cat(
+            (
+                box_feature,
+                cls_feature,
+                torch.abs(box_feature - cls_feature),
+            ),
+            dim=1,
+        )
+        return self.output(self.context(self.reduce(agreement)))
 
 
 class SpatialMorphologyClassificationAdapter(MorphologyAdaptiveAdapter):
@@ -505,6 +577,145 @@ class MorphologyAdaptiveDetect(Detect):
         if self.end2end:
             y = self.postprocess(y.permute(0, 2, 1))
         return y if self.export else (y, preds)
+
+
+class DualGeometryQualityMorphologyDetect(MorphologyAdaptiveDetect):
+    """E8 morphology-adaptive Detect head with detached dual-geometry quality calibration."""
+
+    def __init__(
+        self,
+        nc: int = 80,
+        hidden_ratio: float = 0.125,
+        min_hidden: int = 16,
+        max_hidden: int = 96,
+        strip_kernel: int = 7,
+        context_dilation: int = 2,
+        gate_max: float = 0.5,
+        quality_hidden_ratio: float = 0.125,
+        quality_min_hidden: int = 16,
+        quality_max_hidden: int = 64,
+        quality_scale: float = 1.0,
+        trainable_quality: bool = True,
+        trainable_adapters: bool = True,
+        reg_max: int = 1,
+        end2end: bool = False,
+        ch: tuple = (),
+    ):
+        """Initialize full E8 adapters and independent one-to-many/one-to-one quality heads.
+
+        YAML argument order is ``nc, hidden_ratio, min_hidden, max_hidden, strip_kernel,
+        context_dilation, gate_max, quality_hidden_ratio, quality_min_hidden, quality_max_hidden,
+        quality_scale, trainable_quality, trainable_adapters``. Model parsing appends
+        ``reg_max, end2end, ch``.
+        """
+        super().__init__(
+            nc=nc,
+            hidden_ratio=hidden_ratio,
+            min_hidden=min_hidden,
+            max_hidden=max_hidden,
+            strip_kernel=strip_kernel,
+            context_dilation=context_dilation,
+            gate_max=gate_max,
+            trainable_adapters=trainable_adapters,
+            reg_max=reg_max,
+            end2end=end2end,
+            ch=ch,
+        )
+        if isinstance(quality_scale, bool):
+            raise ValueError(f"quality_scale must be finite and positive, got {quality_scale!r}.")
+        try:
+            finite_quality_scale = math.isfinite(quality_scale)
+        except TypeError as error:
+            raise ValueError(f"quality_scale must be finite and positive, got {quality_scale!r}.") from error
+        if not finite_quality_scale or quality_scale <= 0:
+            raise ValueError(f"quality_scale must be finite and positive, got {quality_scale!r}.")
+        if not isinstance(trainable_quality, bool):
+            raise ValueError(f"trainable_quality must be bool, got {trainable_quality!r}.")
+
+        quality_args = {
+            "hidden_ratio": quality_hidden_ratio,
+            "min_hidden": quality_min_hidden,
+            "max_hidden": quality_max_hidden,
+            "trainable_quality": trainable_quality,
+        }
+        self.quality_scale = float(quality_scale)
+        self.trainable_quality = trainable_quality
+        self.quality_heads = nn.ModuleList(BoxClassAgreementQualityHead(c, **quality_args) for c in ch)
+        if end2end:
+            self.one2one_quality_heads = nn.ModuleList(BoxClassAgreementQualityHead(c, **quality_args) for c in ch)
+
+    def forward_head(
+        self,
+        x: list[torch.Tensor],
+        box_head: torch.nn.Module = None,
+        cls_head: torch.nn.Module = None,
+        box_adapters: torch.nn.Module = None,
+        cls_adapters: torch.nn.Module = None,
+        quality_heads: torch.nn.Module = None,
+    ) -> dict[str, torch.Tensor]:
+        """Run E8 towers and detached class-agnostic quality heads for one assignment branch."""
+        if box_head is None or cls_head is None:
+            return {}
+        if box_adapters is None or cls_adapters is None or quality_heads is None:
+            raise RuntimeError("DualGeometryQualityMorphologyDetect requires box, class, and quality modules.")
+
+        bs = x[0].shape[0]
+        box_outputs, cls_outputs, quality_outputs = [], [], []
+        for i in range(self.nl):
+            box_feature = box_adapters[i](x[i])
+            cls_feature = cls_adapters[i](x[i])
+            box_outputs.append(box_head[i](box_feature).view(bs, 4 * self.reg_max, -1))
+            cls_outputs.append(cls_head[i](cls_feature).view(bs, self.nc, -1))
+            quality_outputs.append(
+                quality_heads[i](
+                    box_feature.detach(),
+                    cls_feature.detach(),
+                ).view(bs, 1, -1)
+            )
+        return {
+            "boxes": torch.cat(box_outputs, dim=-1),
+            "scores": torch.cat(cls_outputs, dim=-1),
+            "quality": torch.cat(quality_outputs, dim=-1),
+            "feats": x,
+        }
+
+    def forward(
+        self, x: list[torch.Tensor]
+    ) -> dict[str, torch.Tensor] | torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Return raw E8 logits during training and quality-calibrated scores during inference."""
+        preds = self.forward_head(
+            x,
+            self.cv2,
+            self.cv3,
+            self.box_adapters,
+            self.cls_adapters,
+            self.quality_heads,
+        )
+        if self.end2end:
+            x_detach = [feature.detach() for feature in x]
+            one2one = self.forward_head(
+                x_detach,
+                self.one2one_cv2,
+                self.one2one_cv3,
+                self.one2one_box_adapters,
+                self.one2one_cls_adapters,
+                self.one2one_quality_heads,
+            )
+            preds = {"one2many": preds, "one2one": one2one}
+        if self.training:
+            return preds
+        y = self._inference(preds["one2one"] if self.end2end else preds)
+        if self.end2end:
+            y = self.postprocess(y.permute(0, 2, 1))
+        return y if self.export else (y, preds)
+
+    def _inference(self, preds: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Decode boxes and apply class-agnostic quality correction before sigmoid."""
+        decoded_boxes = self._get_decode_boxes(preds)
+        quality_correction = self.quality_scale * torch.tanh(preds["quality"])
+        calibrated_logits = preds["scores"] + quality_correction
+        calibrated_scores = calibrated_logits.sigmoid()
+        return torch.cat((decoded_boxes, calibrated_scores), dim=1)
 
 
 class GeometryPreservingSpatialMorphologyDetect(Detect):

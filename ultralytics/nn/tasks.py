@@ -51,6 +51,7 @@ from ultralytics.nn.modules import (
     Detect,
     DWConv,
     DWConvTranspose2d,
+    DualGeometryQualityMorphologyDetect,
     Focus,
     GeometryPreservingSpatialMorphologyDetect,
     GhostBottleneck,
@@ -2086,6 +2087,7 @@ def parse_model(d, ch, verbose=True):
         elif m in frozenset(
             {
                 Detect,
+                DualGeometryQualityMorphologyDetect,
                 GeometryPreservingSpatialMorphologyDetect,
                 MorphologyAdaptiveDetect,
                 WorldDetect,
@@ -2105,6 +2107,7 @@ def parse_model(d, ch, verbose=True):
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
             if m in {
                 Detect,
+                DualGeometryQualityMorphologyDetect,
                 GeometryPreservingSpatialMorphologyDetect,
                 MorphologyAdaptiveDetect,
                 YOLOEDetect,
