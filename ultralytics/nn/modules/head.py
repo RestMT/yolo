@@ -24,6 +24,8 @@ from .utils import bias_init_with_prob, linear_init
 __all__ = (
     "OBB",
     "BoxClassAgreementQualityHead",
+    "ClassConditionalSuppressionDGQMDetect",
+    "ClassConditionalSuppressionHead",
     "Classify",
     "Depth",
     "Detect",
@@ -197,6 +199,80 @@ class BoxClassAgreementQualityHead(nn.Module):
         """Return a zero bypass or quality logits from box/class feature agreement."""
         if not self.trainable_quality:
             return box_feature.new_zeros((box_feature.shape[0], 1, *box_feature.shape[-2:]))
+        if box_feature.shape != cls_feature.shape:
+            raise ValueError(
+                f"box_feature and cls_feature must have identical shapes, got "
+                f"{tuple(box_feature.shape)} and {tuple(cls_feature.shape)}."
+            )
+        agreement = torch.cat(
+            (
+                box_feature,
+                cls_feature,
+                torch.abs(box_feature - cls_feature),
+            ),
+            dim=1,
+        )
+        return self.output(self.context(self.reduce(agreement)))
+
+
+class ClassConditionalSuppressionHead(nn.Module):
+    """Predict class-conditional suppression from detached box/class feature agreement."""
+
+    def __init__(
+        self,
+        channels: int,
+        nc: int,
+        hidden_ratio: float = 0.125,
+        min_hidden: int = 16,
+        max_hidden: int = 64,
+        trainable_suppression: bool = True,
+    ):
+        """Initialize a compact zero-output class-suppression head."""
+        super().__init__()
+        if not isinstance(channels, int) or isinstance(channels, bool) or channels <= 0:
+            raise ValueError(f"channels must be a positive integer, got {channels!r}.")
+        if not isinstance(nc, int) or isinstance(nc, bool) or nc <= 0:
+            raise ValueError(f"nc must be a positive integer, got {nc!r}.")
+        if isinstance(hidden_ratio, bool):
+            raise ValueError(f"hidden_ratio must be finite and positive, got {hidden_ratio!r}.")
+        try:
+            finite_hidden_ratio = math.isfinite(hidden_ratio)
+        except TypeError as error:
+            raise ValueError(f"hidden_ratio must be finite and positive, got {hidden_ratio!r}.") from error
+        if not finite_hidden_ratio or hidden_ratio <= 0:
+            raise ValueError(f"hidden_ratio must be finite and positive, got {hidden_ratio!r}.")
+        for name, value in (("min_hidden", min_hidden), ("max_hidden", max_hidden)):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"{name} must be an integer, got {value!r}.")
+        if min_hidden <= 0:
+            raise ValueError(f"min_hidden must be positive, got {min_hidden}.")
+        if max_hidden < min_hidden:
+            raise ValueError(f"max_hidden must be at least min_hidden, got {max_hidden} < {min_hidden}.")
+        if not isinstance(trainable_suppression, bool):
+            raise ValueError(f"trainable_suppression must be bool, got {trainable_suppression!r}.")
+
+        hidden = int(channels * hidden_ratio)
+        hidden = max(hidden, min_hidden)
+        hidden = min(hidden, max_hidden)
+        hidden = make_divisible(hidden, 8)
+
+        self.channels = channels
+        self.nc = nc
+        self.hidden = hidden
+        self.hidden_ratio = float(hidden_ratio)
+        self.trainable_suppression = trainable_suppression
+        self.reduce = Conv(3 * channels, hidden, k=1, s=1)
+        self.context = DWConv(hidden, hidden, k=3, s=1, d=1)
+        self.output = nn.Conv2d(hidden, nc, kernel_size=1, stride=1, padding=0, bias=True)
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+        if not trainable_suppression:
+            self.requires_grad_(False)
+
+    def forward(self, box_feature: torch.Tensor, cls_feature: torch.Tensor) -> torch.Tensor:
+        """Return a zero bypass or class-conditional suppression logits."""
+        if not self.trainable_suppression:
+            return box_feature.new_zeros((box_feature.shape[0], self.nc, *box_feature.shape[-2:]))
         if box_feature.shape != cls_feature.shape:
             raise ValueError(
                 f"box_feature and cls_feature must have identical shapes, got "
@@ -714,6 +790,181 @@ class DualGeometryQualityMorphologyDetect(MorphologyAdaptiveDetect):
         decoded_boxes = self._get_decode_boxes(preds)
         quality_correction = self.quality_scale * torch.tanh(preds["quality"])
         calibrated_logits = preds["scores"] + quality_correction
+        calibrated_scores = calibrated_logits.sigmoid()
+        return torch.cat((decoded_boxes, calibrated_scores), dim=1)
+
+
+class ClassConditionalSuppressionDGQMDetect(DualGeometryQualityMorphologyDetect):
+    """E10 DGQM head with detached class-conditional suppression calibration."""
+
+    def __init__(
+        self,
+        nc: int = 80,
+        hidden_ratio: float = 0.125,
+        min_hidden: int = 16,
+        max_hidden: int = 96,
+        strip_kernel: int = 7,
+        context_dilation: int = 2,
+        gate_max: float = 0.5,
+        quality_hidden_ratio: float = 0.125,
+        quality_min_hidden: int = 16,
+        quality_max_hidden: int = 64,
+        quality_scale: float = 1.0,
+        trainable_quality: bool = True,
+        trainable_adapters: bool = True,
+        suppression_hidden_ratio: float = 0.125,
+        suppression_min_hidden: int = 16,
+        suppression_max_hidden: int = 64,
+        suppression_scale: float = 1.0,
+        trainable_suppression: bool = True,
+        reg_max: int = 1,
+        end2end: bool = False,
+        ch: tuple = (),
+    ):
+        """Initialize E10 and independent one-to-many/one-to-one suppression heads.
+
+        YAML argument order is ``nc, hidden_ratio, min_hidden, max_hidden, strip_kernel,
+        context_dilation, gate_max, quality_hidden_ratio, quality_min_hidden, quality_max_hidden,
+        quality_scale, trainable_quality, trainable_adapters, suppression_hidden_ratio,
+        suppression_min_hidden, suppression_max_hidden, suppression_scale, trainable_suppression``.
+        Model parsing appends ``reg_max, end2end, ch``.
+        """
+        super().__init__(
+            nc=nc,
+            hidden_ratio=hidden_ratio,
+            min_hidden=min_hidden,
+            max_hidden=max_hidden,
+            strip_kernel=strip_kernel,
+            context_dilation=context_dilation,
+            gate_max=gate_max,
+            quality_hidden_ratio=quality_hidden_ratio,
+            quality_min_hidden=quality_min_hidden,
+            quality_max_hidden=quality_max_hidden,
+            quality_scale=quality_scale,
+            trainable_quality=trainable_quality,
+            trainable_adapters=trainable_adapters,
+            reg_max=reg_max,
+            end2end=end2end,
+            ch=ch,
+        )
+        if isinstance(suppression_scale, bool):
+            raise ValueError(f"suppression_scale must be finite and positive, got {suppression_scale!r}.")
+        try:
+            finite_suppression_scale = math.isfinite(suppression_scale)
+        except TypeError as error:
+            raise ValueError(f"suppression_scale must be finite and positive, got {suppression_scale!r}.") from error
+        if not finite_suppression_scale or suppression_scale <= 0:
+            raise ValueError(f"suppression_scale must be finite and positive, got {suppression_scale!r}.")
+        if not isinstance(trainable_suppression, bool):
+            raise ValueError(f"trainable_suppression must be bool, got {trainable_suppression!r}.")
+
+        suppression_args = {
+            "nc": nc,
+            "hidden_ratio": suppression_hidden_ratio,
+            "min_hidden": suppression_min_hidden,
+            "max_hidden": suppression_max_hidden,
+            "trainable_suppression": trainable_suppression,
+        }
+        self.suppression_scale = float(suppression_scale)
+        self.trainable_suppression = trainable_suppression
+        self.suppression_heads = nn.ModuleList(ClassConditionalSuppressionHead(c, **suppression_args) for c in ch)
+        if end2end:
+            self.one2one_suppression_heads = nn.ModuleList(
+                ClassConditionalSuppressionHead(c, **suppression_args) for c in ch
+            )
+
+    def forward_head(
+        self,
+        x: list[torch.Tensor],
+        box_head: torch.nn.Module = None,
+        cls_head: torch.nn.Module = None,
+        box_adapters: torch.nn.Module = None,
+        cls_adapters: torch.nn.Module = None,
+        quality_heads: torch.nn.Module = None,
+        suppression_heads: torch.nn.Module = None,
+    ) -> dict[str, torch.Tensor]:
+        """Run E10 towers and detached shared-quality and class-suppression heads."""
+        if box_head is None or cls_head is None:
+            return {}
+        if (
+            box_adapters is None
+            or cls_adapters is None
+            or quality_heads is None
+            or suppression_heads is None
+        ):
+            raise RuntimeError(
+                "ClassConditionalSuppressionDGQMDetect requires box, class, quality, and suppression modules."
+            )
+
+        bs = x[0].shape[0]
+        box_outputs, cls_outputs, quality_outputs, suppression_outputs = [], [], [], []
+        for i in range(self.nl):
+            box_feature = box_adapters[i](x[i])
+            cls_feature = cls_adapters[i](x[i])
+            detached_box_feature = box_feature.detach()
+            detached_cls_feature = cls_feature.detach()
+            box_outputs.append(box_head[i](box_feature).view(bs, 4 * self.reg_max, -1))
+            cls_outputs.append(cls_head[i](cls_feature).view(bs, self.nc, -1))
+            quality_outputs.append(
+                quality_heads[i](
+                    detached_box_feature,
+                    detached_cls_feature,
+                ).view(bs, 1, -1)
+            )
+            suppression_outputs.append(
+                suppression_heads[i](
+                    detached_box_feature,
+                    detached_cls_feature,
+                ).view(bs, self.nc, -1)
+            )
+        return {
+            "boxes": torch.cat(box_outputs, dim=-1),
+            "scores": torch.cat(cls_outputs, dim=-1),
+            "quality": torch.cat(quality_outputs, dim=-1),
+            "class_suppression": torch.cat(suppression_outputs, dim=-1),
+            "feats": x,
+        }
+
+    def forward(
+        self, x: list[torch.Tensor]
+    ) -> dict[str, torch.Tensor] | torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Return raw E10 plus suppression logits or class-selectively calibrated scores."""
+        preds = self.forward_head(
+            x,
+            self.cv2,
+            self.cv3,
+            self.box_adapters,
+            self.cls_adapters,
+            self.quality_heads,
+            self.suppression_heads,
+        )
+        if self.end2end:
+            x_detach = [feature.detach() for feature in x]
+            one2one = self.forward_head(
+                x_detach,
+                self.one2one_cv2,
+                self.one2one_cv3,
+                self.one2one_box_adapters,
+                self.one2one_cls_adapters,
+                self.one2one_quality_heads,
+                self.one2one_suppression_heads,
+            )
+            preds = {"one2many": preds, "one2one": one2one}
+        if self.training:
+            return preds
+        y = self._inference(preds["one2one"] if self.end2end else preds)
+        if self.end2end:
+            y = self.postprocess(y.permute(0, 2, 1))
+        return y if self.export else (y, preds)
+
+    def _inference(self, preds: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Decode boxes and add shared quality plus suppression-only class corrections."""
+        decoded_boxes = self._get_decode_boxes(preds)
+        shared_quality_correction = self.quality_scale * torch.tanh(preds["quality"])
+        class_suppression_correction = self.suppression_scale * torch.tanh(
+            preds["class_suppression"]
+        ).clamp(max=0.0)
+        calibrated_logits = preds["scores"] + shared_quality_correction + class_suppression_correction
         calibrated_scores = calibrated_logits.sigmoid()
         return torch.cat((decoded_boxes, calibrated_scores), dim=1)
 

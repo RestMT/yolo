@@ -42,6 +42,7 @@ from ultralytics.nn.modules import (
     C3x,
     CBFuse,
     CBLinear,
+    ClassConditionalSuppressionDGQMDetect,
     Classify,
     Concat,
     Conv,
@@ -2086,6 +2087,7 @@ def parse_model(d, ch, verbose=True):
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(
             {
+                ClassConditionalSuppressionDGQMDetect,
                 Detect,
                 DualGeometryQualityMorphologyDetect,
                 GeometryPreservingSpatialMorphologyDetect,
@@ -2106,6 +2108,7 @@ def parse_model(d, ch, verbose=True):
             if m is Segment or m is YOLOESegment or m is Segment26 or m is YOLOESegment26:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
             if m in {
+                ClassConditionalSuppressionDGQMDetect,
                 Detect,
                 DualGeometryQualityMorphologyDetect,
                 GeometryPreservingSpatialMorphologyDetect,
