@@ -30,6 +30,8 @@ __all__ = (
     "Depth",
     "Detect",
     "DualGeometryQualityMorphologyDetect",
+    "ForegroundnessAgreementHead",
+    "ForegroundnessFactorizedDGQMDetect",
     "GeometryPreservingSpatialMorphologyDetect",
     "MorphologyAdaptiveAdapter",
     "MorphologyAdaptiveDetect",
@@ -213,6 +215,28 @@ class BoxClassAgreementQualityHead(nn.Module):
             dim=1,
         )
         return self.output(self.context(self.reduce(agreement)))
+
+
+class ForegroundnessAgreementHead(BoxClassAgreementQualityHead):
+    """Predict class-agnostic foregroundness from detached box/class feature agreement."""
+
+    def __init__(
+        self,
+        channels: int,
+        hidden_ratio: float = 0.125,
+        min_hidden: int = 16,
+        max_hidden: int = 64,
+        trainable_foreground: bool = True,
+    ):
+        """Initialize the E10 agreement structure with a zero foreground output."""
+        super().__init__(
+            channels=channels,
+            hidden_ratio=hidden_ratio,
+            min_hidden=min_hidden,
+            max_hidden=max_hidden,
+            trainable_quality=trainable_foreground,
+        )
+        self.trainable_foreground = trainable_foreground
 
 
 class ClassConditionalSuppressionHead(nn.Module):
@@ -790,6 +814,178 @@ class DualGeometryQualityMorphologyDetect(MorphologyAdaptiveDetect):
         decoded_boxes = self._get_decode_boxes(preds)
         quality_correction = self.quality_scale * torch.tanh(preds["quality"])
         calibrated_logits = preds["scores"] + quality_correction
+        calibrated_scores = calibrated_logits.sigmoid()
+        return torch.cat((decoded_boxes, calibrated_scores), dim=1)
+
+
+class ForegroundnessFactorizedDGQMDetect(DualGeometryQualityMorphologyDetect):
+    """E10 DGQM head with detached class-agnostic foregroundness factorization."""
+
+    def __init__(
+        self,
+        nc: int = 80,
+        hidden_ratio: float = 0.125,
+        min_hidden: int = 16,
+        max_hidden: int = 96,
+        strip_kernel: int = 7,
+        context_dilation: int = 2,
+        gate_max: float = 0.5,
+        quality_hidden_ratio: float = 0.125,
+        quality_min_hidden: int = 16,
+        quality_max_hidden: int = 64,
+        quality_scale: float = 1.0,
+        trainable_quality: bool = True,
+        trainable_adapters: bool = True,
+        foreground_hidden_ratio: float = 0.125,
+        foreground_min_hidden: int = 16,
+        foreground_max_hidden: int = 64,
+        foreground_scale: float = 0.5,
+        trainable_foreground: bool = True,
+        reg_max: int = 1,
+        end2end: bool = False,
+        ch: tuple = (),
+    ):
+        """Initialize E10 and independent one-to-many/one-to-one foreground heads.
+
+        YAML argument order is ``nc, hidden_ratio, min_hidden, max_hidden, strip_kernel,
+        context_dilation, gate_max, quality_hidden_ratio, quality_min_hidden, quality_max_hidden,
+        quality_scale, trainable_quality, trainable_adapters, foreground_hidden_ratio,
+        foreground_min_hidden, foreground_max_hidden, foreground_scale, trainable_foreground``.
+        Model parsing appends ``reg_max, end2end, ch``.
+        """
+        super().__init__(
+            nc=nc,
+            hidden_ratio=hidden_ratio,
+            min_hidden=min_hidden,
+            max_hidden=max_hidden,
+            strip_kernel=strip_kernel,
+            context_dilation=context_dilation,
+            gate_max=gate_max,
+            quality_hidden_ratio=quality_hidden_ratio,
+            quality_min_hidden=quality_min_hidden,
+            quality_max_hidden=quality_max_hidden,
+            quality_scale=quality_scale,
+            trainable_quality=trainable_quality,
+            trainable_adapters=trainable_adapters,
+            reg_max=reg_max,
+            end2end=end2end,
+            ch=ch,
+        )
+        if isinstance(foreground_scale, bool):
+            raise ValueError(f"foreground_scale must be finite and positive, got {foreground_scale!r}.")
+        try:
+            finite_foreground_scale = math.isfinite(foreground_scale)
+        except TypeError as error:
+            raise ValueError(f"foreground_scale must be finite and positive, got {foreground_scale!r}.") from error
+        if not finite_foreground_scale or foreground_scale <= 0:
+            raise ValueError(f"foreground_scale must be finite and positive, got {foreground_scale!r}.")
+        if not isinstance(trainable_foreground, bool):
+            raise ValueError(f"trainable_foreground must be bool, got {trainable_foreground!r}.")
+
+        foreground_args = {
+            "hidden_ratio": foreground_hidden_ratio,
+            "min_hidden": foreground_min_hidden,
+            "max_hidden": foreground_max_hidden,
+            "trainable_foreground": trainable_foreground,
+        }
+        self.foreground_scale = float(foreground_scale)
+        self.trainable_foreground = trainable_foreground
+        self.foreground_heads = nn.ModuleList(ForegroundnessAgreementHead(c, **foreground_args) for c in ch)
+        if end2end:
+            self.one2one_foreground_heads = nn.ModuleList(
+                ForegroundnessAgreementHead(c, **foreground_args) for c in ch
+            )
+
+    def forward_head(
+        self,
+        x: list[torch.Tensor],
+        box_head: torch.nn.Module = None,
+        cls_head: torch.nn.Module = None,
+        box_adapters: torch.nn.Module = None,
+        cls_adapters: torch.nn.Module = None,
+        quality_heads: torch.nn.Module = None,
+        foreground_heads: torch.nn.Module = None,
+    ) -> dict[str, torch.Tensor]:
+        """Run E10 towers and detached shared-quality and foreground heads."""
+        if box_head is None or cls_head is None:
+            return {}
+        if (
+            box_adapters is None
+            or cls_adapters is None
+            or quality_heads is None
+            or foreground_heads is None
+        ):
+            raise RuntimeError(
+                "ForegroundnessFactorizedDGQMDetect requires box, class, quality, and foreground modules."
+            )
+
+        bs = x[0].shape[0]
+        box_outputs, cls_outputs, quality_outputs, foreground_outputs = [], [], [], []
+        for i in range(self.nl):
+            box_feature = box_adapters[i](x[i])
+            cls_feature = cls_adapters[i](x[i])
+            detached_box_feature = box_feature.detach()
+            detached_cls_feature = cls_feature.detach()
+            box_outputs.append(box_head[i](box_feature).view(bs, 4 * self.reg_max, -1))
+            cls_outputs.append(cls_head[i](cls_feature).view(bs, self.nc, -1))
+            quality_outputs.append(
+                quality_heads[i](
+                    detached_box_feature,
+                    detached_cls_feature,
+                ).view(bs, 1, -1)
+            )
+            foreground_outputs.append(
+                foreground_heads[i](
+                    detached_box_feature,
+                    detached_cls_feature,
+                ).view(bs, 1, -1)
+            )
+        return {
+            "boxes": torch.cat(box_outputs, dim=-1),
+            "scores": torch.cat(cls_outputs, dim=-1),
+            "quality": torch.cat(quality_outputs, dim=-1),
+            "foreground": torch.cat(foreground_outputs, dim=-1),
+            "feats": x,
+        }
+
+    def forward(
+        self, x: list[torch.Tensor]
+    ) -> dict[str, torch.Tensor] | torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Return raw E10 plus foreground logits or factorized calibrated scores."""
+        preds = self.forward_head(
+            x,
+            self.cv2,
+            self.cv3,
+            self.box_adapters,
+            self.cls_adapters,
+            self.quality_heads,
+            self.foreground_heads,
+        )
+        if self.end2end:
+            x_detach = [feature.detach() for feature in x]
+            one2one = self.forward_head(
+                x_detach,
+                self.one2one_cv2,
+                self.one2one_cv3,
+                self.one2one_box_adapters,
+                self.one2one_cls_adapters,
+                self.one2one_quality_heads,
+                self.one2one_foreground_heads,
+            )
+            preds = {"one2many": preds, "one2one": one2one}
+        if self.training:
+            return preds
+        y = self._inference(preds["one2one"] if self.end2end else preds)
+        if self.end2end:
+            y = self.postprocess(y.permute(0, 2, 1))
+        return y if self.export else (y, preds)
+
+    def _inference(self, preds: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Decode boxes and add shared-quality plus symmetric foreground corrections."""
+        decoded_boxes = self._get_decode_boxes(preds)
+        quality_correction = self.quality_scale * torch.tanh(preds["quality"])
+        foreground_correction = self.foreground_scale * torch.tanh(preds["foreground"])
+        calibrated_logits = preds["scores"] + quality_correction + foreground_correction
         calibrated_scores = calibrated_logits.sigmoid()
         return torch.cat((decoded_boxes, calibrated_scores), dim=1)
 
